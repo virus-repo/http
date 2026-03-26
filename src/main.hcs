@@ -1,1 +1,452 @@
+// http.hcs – Klient i serwer HTTP/1.1
+// Użycie: from [http] require [Client, Server, Request, Response, get, post, serve]
 
+from [std] require [io, string, math]
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Deklaracje extern (POSIX sockets)
+// ──────────────────────────────────────────────────────────────────────────────
+
+extern
+    header [sys/socket.h]
+    header [netinet/in.h]
+    header [arpa/inet.h]
+    header [unistd.h]
+    header [fcntl.h]
+    header [sys/select.h]
+    header [string.h]
+    header [stdlib.h]
+    header [netdb.h]
+
+    // Socket functions
+    fn socket(i32 domain, i32 type, i32 protocol) : i32
+    fn connect(i32 sockfd, ptr addr, u32 addrlen) : i32
+    fn bind(i32 sockfd, ptr addr, u32 addrlen) : i32
+    fn listen(i32 sockfd, i32 backlog) : i32
+    fn accept(i32 sockfd, ptr addr, ptr addrlen) : i32
+    fn send(i32 sockfd, ptr buf, u64 len, i32 flags) : i64
+    fn recv(i32 sockfd, ptr buf, u64 len, i32 flags) : i64
+    fn close(i32 fd) : i32
+    fn fcntl(i32 fd, i32 cmd, i32 arg) : i32
+
+    // Address structures
+    struct sockaddr_in {
+        sin_family: u16,
+        sin_port: u16,
+        sin_addr: u32,
+        sin_zero: [u8; 8]
+    }
+    struct sockaddr { sa_family: u16, sa_data: [u8; 14] }
+    const AF_INET: i32 = 2
+    const SOCK_STREAM: i32 = 1
+    const INADDR_ANY: u32 = 0
+    const F_SETFL: i32 = 4
+    const O_NONBLOCK: i32 = 2048
+    const SOL_SOCKET: i32 = 1
+    const SO_REUSEADDR: i32 = 2
+
+    // Hostname resolution
+    struct hostent { h_name: ptr(u8), h_aliases: ptr(ptr(u8)), h_addrtype: i32, h_length: i32, h_addr_list: ptr(ptr(u8)) }
+    fn gethostbyname(ptr name) : ptr(hostent)
+
+    // select
+    struct fd_set { fds_bits: [i64; 16] } // uproszczone
+    fn FD_ZERO(ptr set)
+    fn FD_SET(i32 fd, ptr set)
+    fn FD_ISSET(i32 fd, ptr set) : i32
+    fn select(i32 nfds, ptr readfds, ptr writefds, ptr exceptfds, ptr timeout) : i32
+    const NULL: ptr = 0
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Typy
+// ──────────────────────────────────────────────────────────────────────────────
+
+struct Request {
+    method: str
+    path: str
+    query: str
+    version: str
+    headers: [(str, str)]
+    body: str
+    remote_addr: str
+}
+
+struct Response {
+    status: i32
+    status_text: str
+    headers: [(str, str)]
+    body: str
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Pomocnicze funkcje
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn split_once(s: str, sep: str) : (str, str) {
+    let idx = s.find(sep)
+    if idx < 0 { return (s, "") }
+    return (s.ptr[0..idx] as str, s.ptr[idx+sep.len..] as str)
+}
+
+fn parse_url(url: str) : (str, str, i32, str, str) {
+    // zwraca: (scheme, host, port, path, query)
+    let (scheme, rest) = split_once(url, "://")
+    if scheme == "" { return ("http", "", 80, "", "") }
+    let (host, path_query) = split_once(rest, "/")
+    let mut port = 80
+    let host_parts = host.split(":")
+    let hostname = host_parts[0]
+    if host_parts.len > 1 {
+        port = host_parts[1].to_i32()
+    }
+    let (path, query) = split_once(path_query, "?")
+    let full_path = "/" + path
+    return (scheme, hostname, port, full_path, query)
+}
+
+fn status_text(code: i32) : str {
+    match code {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        _ => "Unknown"
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Funkcje gniazd (niskopoziomowe)
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn socket_create() : i32 {
+    direct {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        if fd < 0 { return -1 }
+        // set non-blocking
+        fcntl(fd, F_SETFL, O_NONBLOCK)
+        // enable address reuse
+        let opt = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, 4)
+        return fd
+    }
+}
+
+fn socket_connect(host: str, port: i32) : i32 {
+    direct {
+        let fd = socket_create()
+        if fd < 0 { return -1 }
+        let addr = HCS_ALLOC_ZERO(_scope_arena, sockaddr_in)
+        addr.sin_family = AF_INET
+        addr.sin_port = htons(port)
+        // resolve hostname
+        let he = gethostbyname(host.ptr)
+        if he == 0 {
+            close(fd)
+            return -1
+        }
+        let ip = *(he.h_addr_list[0] as ptr(u32))
+        addr.sin_addr = ip
+        if connect(fd, addr, 16) < 0 {
+            close(fd)
+            return -1
+        }
+        return fd
+    }
+}
+
+fn socket_listen(port: i32, backlog: i32) : i32 {
+    direct {
+        let fd = socket_create()
+        if fd < 0 { return -1 }
+        let addr = HCS_ALLOC_ZERO(_scope_arena, sockaddr_in)
+        addr.sin_family = AF_INET
+        addr.sin_port = htons(port)
+        addr.sin_addr = INADDR_ANY
+        if bind(fd, addr, 16) < 0 {
+            close(fd)
+            return -1
+        }
+        if listen(fd, backlog) < 0 {
+            close(fd)
+            return -1
+        }
+        return fd
+    }
+}
+
+fn socket_send(fd: i32, data: str) : i64 {
+    direct {
+        return send(fd, data.ptr, data.len, 0)
+    }
+}
+
+fn socket_recv(fd: i32, buf: ptr(u8), len: u64) : i64 {
+    direct {
+        return recv(fd, buf, len, 0)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Parsowanie HTTP
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn parse_request(data: str) : Option<Request> {
+    let lines = data.split("\r\n")
+    if lines.len == 0 { return nil }
+    let parts = lines[0].split(" ")
+    if parts.len < 3 { return nil }
+    let method = parts[0]
+    let full_path = parts[1]
+    let version = parts[2]
+    let (path, query) = split_once(full_path, "?")
+    let mut headers = [] as [(str, str)]
+    let mut i = 1
+    while i < lines.len {
+        let line = lines[i]
+        if line == "" { break }
+        let (key, value) = split_once(line, ": ")
+        headers.push((key, value))
+        i += 1
+    }
+    // body zaczyna się po pustej linii
+    let body_start = i + 1
+    let body = if body_start < lines.len {
+        lines[body_start..].join("\r\n")
+    } else {
+        ""
+    }
+    return Request {
+        method: method, path: path, query: query, version: version,
+        headers: headers, body: body, remote_addr: ""
+    }
+}
+
+fn parse_response(data: str) : Option<Response> {
+    let lines = data.split("\r\n")
+    if lines.len == 0 { return nil }
+    let parts = lines[0].split(" ")
+    if parts.len < 2 { return nil }
+    let version = parts[0]
+    let status = parts[1].to_i32()
+    let status_text = parts[2..].join(" ")
+    let mut headers = [] as [(str, str)]
+    let mut i = 1
+    while i < lines.len {
+        let line = lines[i]
+        if line == "" { break }
+        let (key, value) = split_once(line, ": ")
+        headers.push((key, value))
+        i += 1
+    }
+    let body_start = i + 1
+    let body = if body_start < lines.len {
+        lines[body_start..].join("\r\n")
+    } else {
+        ""
+    }
+    return Response { status: status, status_text: status_text, headers: headers, body: body }
+}
+
+fn serialize_response(resp: Response) : str {
+    let mut out = "HTTP/1.1 " + resp.status.to_string() + " " + resp.status_text + "\r\n"
+    for (k, v) in resp.headers {
+        out += k + ": " + v + "\r\n"
+    }
+    out += "Content-Length: " + resp.body.len.to_string() + "\r\n"
+    out += "\r\n"
+    out += resp.body
+    return out
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Klient HTTP
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn request(method: str, url: str, headers: [(str, str)], body: str) : Option<Response> {
+    let (scheme, host, port, path, query) = parse_url(url)
+    if scheme != "http" { return nil }
+    let fd = socket_connect(host, port)
+    if fd < 0 { return nil }
+    let req_str = method + " " + path + (if query != "" { "?" + query } else { "" }) + " HTTP/1.1\r\n"
+    let req_str = req_str + "Host: " + host + "\r\n"
+    for (k, v) in headers {
+        req_str += k + ": " + v + "\r\n"
+    }
+    req_str += "Content-Length: " + body.len.to_string() + "\r\n"
+    req_str += "\r\n"
+    req_str += body
+    if socket_send(fd, req_str) < 0 {
+        close(fd)
+        return nil
+    }
+    let mut buf = HCS_ALLOC_N(_scope_arena, u8, 4096)
+    let mut recv_data = "" as str
+    while true {
+        let n = socket_recv(fd, buf, 4096)
+        if n <= 0 { break }
+        recv_data += buf[0..n] as str
+        if recv_data.find("\r\n\r\n") >= 0 {
+            // sprawdź Content-Length
+            let header_end = recv_data.find("\r\n\r\n") + 4
+            let headers_part = recv_data.ptr[0..header_end] as str
+            let content_len = extract_content_length(headers_part)
+            if content_len > 0 {
+                let total_needed = header_end + content_len
+                if recv_data.len >= total_needed { break }
+            } else {
+                break // zakładamy, że to koniec
+            }
+        }
+    }
+    close(fd)
+    return parse_response(recv_data)
+}
+
+fn extract_content_length(headers: str) : i64 {
+    let lines = headers.split("\r\n")
+    for line in lines {
+        let (key, val) = split_once(line, ": ")
+        if key == "Content-Length" {
+            return val.to_i64()
+        }
+    }
+    return 0
+}
+
+fn get(url: str, headers: [(str, str)]) : Option<Response> {
+    return request("GET", url, headers, "")
+}
+
+fn post(url: str, data: str, headers: [(str, str)]) : Option<Response> {
+    let mut h = headers
+    h.push(("Content-Type", "application/x-www-form-urlencoded"))
+    return request("POST", url, h, data)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Serwer HTTP
+// ──────────────────────────────────────────────────────────────────────────────
+
+type Handler = fn(Request) -> Response
+
+obj Server {
+    port: i32
+    handler: Handler
+    running: bool
+}
+
+fn server_new(port: i32, handler: Handler) : Server {
+    let s = HCS_ALLOC_ZERO(_scope_arena, Server)
+    s.port = port
+    s.handler = handler
+    s.running = true
+    return s
+}
+
+fn server_serve(s: Server) {
+    let listen_fd = socket_listen(s.port, 128)
+    if listen_fd < 0 {
+        eprintln("Failed to bind to port " + s.port.to_string())
+        return
+    }
+    let mut fd_set_read = HCS_ALLOC_ZERO(_scope_arena, fd_set)
+    let mut clients = [] as [i32]
+    while s.running {
+        FD_ZERO(fd_set_read)
+        FD_SET(listen_fd, fd_set_read)
+        let max_fd = listen_fd
+        for fd in clients {
+            FD_SET(fd, fd_set_read)
+            if fd > max_fd { max_fd = fd }
+        }
+        let ready = select(max_fd+1, fd_set_read, NULL, NULL, NULL)
+        if ready < 0 { break }
+        if FD_ISSET(listen_fd, fd_set_read) {
+            let client_fd = accept(listen_fd, NULL, NULL)
+            if client_fd >= 0 {
+                clients.push(client_fd)
+            }
+        }
+        let mut to_remove = [] as [i32]
+        for fd in clients {
+            if FD_ISSET(fd, fd_set_read) {
+                let buf = HCS_ALLOC_N(_scope_arena, u8, 8192)
+                let n = socket_recv(fd, buf, 8192)
+                if n <= 0 {
+                    to_remove.push(fd)
+                    close(fd)
+                } else {
+                    let data = buf[0..n] as str
+                    let req = parse_request(data)
+                    if req != nil {
+                        let resp = s.handler(req)
+                        let resp_str = serialize_response(resp)
+                        socket_send(fd, resp_str)
+                        // po odpowiedzi zamykamy połączenie (proste)
+                        to_remove.push(fd)
+                        close(fd)
+                    } else {
+                        // błąd parsowania
+                        let resp = Response {
+                            status: 400,
+                            status_text: "Bad Request",
+                            headers: [],
+                            body: ""
+                        }
+                        let resp_str = serialize_response(resp)
+                        socket_send(fd, resp_str)
+                        to_remove.push(fd)
+                        close(fd)
+                    }
+                }
+            }
+        }
+        for fd in to_remove {
+            let idx = clients.find(fd)
+            if idx >= 0 {
+                clients.remove(idx)
+            }
+        }
+    }
+    close(listen_fd)
+    for fd in clients { close(fd) }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Przykład użycia (komentarz)
+// ──────────────────────────────────────────────────────────────────────────────
+/*
+from [http] require [get, post, serve, server_new, Request, Response]
+
+fn hello_handler(req: Request) -> Response {
+    let body = "Hello, " + req.remote_addr + "!"
+    return Response {
+        status: 200,
+        status_text: "OK",
+        headers: [("Content-Type", "text/plain")],
+        body: body
+    }
+}
+
+fn main() : i32 {
+    // Klient
+    let resp = get("http://httpbin.org/get", [])
+    if resp != nil {
+        write [Status: {resp.status}]
+        write [Body: {resp.body}]
+    }
+
+    // Serwer
+    let server = server_new(8080, hello_handler)
+    serve(server)
+    return 0
+}
+*/
